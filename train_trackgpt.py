@@ -32,7 +32,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'out-trackgpt'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -41,10 +41,10 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
-wandb_project = 'owt'
+wandb_project = 'trackgpt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'ais'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -71,7 +71,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+# compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -113,18 +113,41 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        offsets = np.load(os.path.join(data_dir, 'train_track_offsets.npy'))
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        offsets = np.load(os.path.join(data_dir, 'val_track_offsets.npy'))
+    
+    x_list = []
+    y_list = []
+    # Keep sampling until we fill the batch
+    while len(x_list) < batch_size:
+        # Randomly select a track (by index)
+        track_idx = np.random.randint(0, len(offsets))
+        start, end = offsets[track_idx]
+        track_length = end - start
+
+        if track_length <= block_size:
+            continue  # Skip short tracks
+
+        rand_offset = np.random.randint(start, end - block_size)
+
+        tokens = data[rand_offset: rand_offset + block_size + 1]
+        
+        # Convert to torch tensors (ensuring type is int64)
+        x_list.append(torch.from_numpy(tokens[:-1].astype(np.int64)))
+        y_list.append(torch.from_numpy(tokens[1:].astype(np.int64)))
+    
+    # Stack individual examples into a batch.
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
+    
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        # Pin memory and transfer to GPU asynchronously.
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
